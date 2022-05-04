@@ -2,6 +2,7 @@ package statesync
 
 import (
 	"errors"
+	"os"
 	"sort"
 	"time"
 
@@ -22,6 +23,10 @@ const (
 	ChunkChannel = byte(0x61)
 	// recentSnapshots is the number of recent snapshots to send and receive per peer.
 	recentSnapshots = 10
+)
+
+var (
+	requestSnapshots = true
 )
 
 // Reactor handles state sync, both restoring snapshots for the local node and serving snapshots
@@ -266,15 +271,32 @@ func (r *Reactor) Sync(stateProvider StateProvider, discoveryTime time.Duration)
 	r.syncer = newSyncer(r.cfg, r.Logger, r.conn, r.connQuery, stateProvider, r.tempDir)
 	r.mtx.Unlock()
 
-	hook := func() {
-		r.Logger.Debug("Requesting snapshots from known peers")
-		// Request snapshots from all currently connected peers
-		r.Switch.Broadcast(SnapshotChannel, mustEncodeMsg(&ssproto.SnapshotsRequest{}))
+	var (
+		state  sm.State
+		commit *types.Commit
+		err    error
+	)
+
+	if snapshotDir := os.Getenv("SNAPSHOT_IMPORT_DIR"); snapshotDir != "" {
+		// Do not request snapshots or chunks from the network since we're restoring from a static snapshot
+		requestSnapshots = false
+
+		state, commit, err = r.syncer.SyncFromLocalSnapshot(snapshotDir)
+		if err != nil {
+			// Blow up here so it's easier to spot any issues with snapshot restore
+			panic(err)
+		}
+	} else {
+		hook := func() {
+			r.Logger.Debug("Requesting snapshots from known peers")
+			// Request snapshots from all currently connected peers
+			r.Switch.Broadcast(SnapshotChannel, mustEncodeMsg(&ssproto.SnapshotsRequest{}))
+		}
+
+		hook()
+
+		state, commit, err = r.syncer.SyncAny(discoveryTime, hook)
 	}
-
-	hook()
-
-	state, commit, err := r.syncer.SyncAny(discoveryTime, hook)
 
 	r.mtx.Lock()
 	r.syncer = nil
